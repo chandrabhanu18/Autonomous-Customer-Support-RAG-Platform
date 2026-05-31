@@ -1,0 +1,87 @@
+name: CI Smoke Test (services)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    services:
+      db:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_DB: intellisupport
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd "pg_isready -U postgres -d intellisupport"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install OS packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc build-essential libpq-dev
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: |
+          pytest -q
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            pg_isready -h localhost -p 5432 -U postgres -d intellisupport && break || echo "waiting..." && sleep 2
+          done
+
+      - name: Run migrations and seed
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/intellisupport
+        run: |
+          python scripts/run_migrations.py
+          python scripts/seed_database.py
+
+      - name: Start app
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/intellisupport
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          nohup uvicorn api.main:app --host 0.0.0.0 --port 8000 &
+          sleep 3
+
+      - name: Ensure OPENAI_API_KEY is set (fail on main, warn on branches)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              echo "::error::OPENAI_API_KEY secret is not set. On 'main' this job requires the secret to be present. Set repository secret 'OPENAI_API_KEY'."
+              exit 1
+            else
+              echo "::warning::OPENAI_API_KEY secret is not set. Tests will run with deterministic fallbacks; set repository secret 'OPENAI_API_KEY' for full integration tests."
+            fi
+          else
+            echo "OPENAI_API_KEY is set."
+          fi
+
+      - name: Run smoke tests
+        run: python scripts/compose_smoke_test.py
+
+      - name: Tear down app
+        if: always()
+        run: pkill -f uvicorn || true
